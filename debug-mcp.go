@@ -6,9 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"image/png"
-	"io"
 	"log"
-	"net"
 	"os"
 	"regexp"
 	"sort"
@@ -17,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/electricbubble/gadb"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"go.bug.st/serial"
@@ -447,13 +444,9 @@ func main() {
 				if args["serial"] != nil && !ok {
 					return mcp.NewToolResultError("serial 必须是字符串"), nil
 				}
-				dev, err := selectDevice(serial)
-				if err != nil {
-					return mcp.NewToolResultError(err.Error()), nil
-				}
 				if tool.image {
-					// exec: is adb exec-out. shell: would translate newlines and corrupt the PNG.
-					output, err := adbExecOut(dev.Serial(), "screencap -p")
+					// exec: is the binary channel. shell: would translate newlines and corrupt the PNG.
+					output, err := usbService(serial, tool.service, 30*time.Second)
 					if err != nil {
 						return mcp.NewToolResultError(err.Error()), nil
 					}
@@ -462,10 +455,11 @@ func main() {
 					}
 					return mcp.NewToolResultImage("截图成功", base64.StdEncoding.EncodeToString(output), "image/png"), nil
 				}
-				text, err := adbHostCommand(dev.Serial(), tool.service)
+				output, err := usbService(serial, tool.service, 15*time.Second)
 				if err != nil {
 					return mcp.NewToolResultError(err.Error()), nil
 				}
+				text := strings.TrimSpace(string(output))
 				if tool.name == "adb_root" {
 					text, err = rootResult(ctx, text)
 					if err != nil {
@@ -485,157 +479,13 @@ func main() {
 	}
 }
 
-// adbServerAddr is the IPv4 socket the adb server listens on. "localhost"
-// can resolve to ::1, which Windows rejects when adb is bound to 127.0.0.1.
-var adbServerAddr = fmt.Sprintf("127.0.0.1:%d", gadb.AdbServerPort)
-
-// adbCommandDeadline bounds root/reboot. Those services usually close
-// right after OKAY; the deadline stops a stuck socket from hanging.
-var adbCommandDeadline = 10 * time.Second
-
-// adbScreenshotDeadline bounds exec-out screencap, which streams a PNG.
-var adbScreenshotDeadline = 30 * time.Second
-
-// adbRootRestartWait matches the adb client: after adbd says it is
+// adbRootRestartWait matches the usual client: after adbd says it is
 // restarting, wait for it to come back before the tool returns.
 var adbRootRestartWait = 3 * time.Second
 
-// listADBDevices dials 127.0.0.1:5037 on every call. It does not look up
-// or start the adb executable. A failed startup used to keep a zero
-// client and later dial ":0".
-func listADBDevices() ([]gadb.Device, error) {
-	stdout, stderr := os.Stdout, os.Stderr
-	if logFile != nil {
-		os.Stdout = logFile
-		os.Stderr = logFile
-	}
-	defer func() {
-		os.Stdout = stdout
-		os.Stderr = stderr
-	}()
-
-	client, err := gadb.NewClientWith("127.0.0.1", gadb.AdbServerPort)
-	if err != nil {
-		return nil, fmt.Errorf("连接 ADB 服务 %s 失败: %w", adbServerAddr, err)
-	}
-	return client.DeviceList()
-}
-
-// selectDevice picks a device from the ADB server. An empty serial is
-// accepted only when exactly one device is connected.
-func selectDevice(serial string) (gadb.Device, error) {
-	devices, err := listADBDevices()
-	if err != nil {
-		return gadb.Device{}, err
-	}
-
-	serial = strings.TrimSpace(serial)
-	if serial != "" {
-		for _, dev := range devices {
-			if dev.Serial() == serial {
-				return dev, nil
-			}
-		}
-		return gadb.Device{}, fmt.Errorf("未找到序列号为 %s 的 ADB 设备", serial)
-	}
-	switch len(devices) {
-	case 0:
-		return gadb.Device{}, fmt.Errorf("没有已连接的 ADB 设备")
-	case 1:
-		return devices[0], nil
-	default:
-		return gadb.Device{}, fmt.Errorf("连接了多台设备，请传入 serial")
-	}
-}
-
-// adbHostCommand sends a device-scoped ADB host command ("root:",
-// "reboot:", ...) over the ADB server protocol. root: and reboot: are
-// fire-and-forget: adbd often closes right after OKAY, so bytes read
-// after that are best-effort status text.
-func adbHostCommand(serial, service string) (string, error) {
-	rest, err := adbExchange(serial, service, adbCommandDeadline, false)
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(rest)), nil
-}
-
-// adbExecOut runs a device command the way `adb exec-out` does, returning
-// the raw stdout. Screenshot uses this so PNG bytes are not CRLF-translated.
-func adbExecOut(serial, command string) ([]byte, error) {
-	return adbExchange(serial, "exec:"+command, adbScreenshotDeadline, true)
-}
-
-func adbExchange(serial, service string, deadline time.Duration, strictBody bool) ([]byte, error) {
-	conn, err := net.DialTimeout("tcp", adbServerAddr, 5*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("连接 ADB 服务 %s 失败: %w", adbServerAddr, err)
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(deadline))
-
-	if err := adbSend(conn, fmt.Sprintf("host:transport:%s", serial)); err != nil {
-		return nil, err
-	}
-	if err := adbCheckOKAY(conn); err != nil {
-		return nil, fmt.Errorf("选择设备 %s 失败: %w", serial, err)
-	}
-
-	if err := adbSend(conn, service); err != nil {
-		return nil, err
-	}
-	if err := adbCheckOKAY(conn); err != nil {
-		return nil, err
-	}
-
-	rest, err := io.ReadAll(conn)
-	if strictBody && err != nil {
-		return nil, fmt.Errorf("读取 ADB 响应失败: %w", err)
-	}
-	return rest, nil
-}
-
-func adbSend(conn net.Conn, command string) error {
-	msg := fmt.Sprintf("%04x%s", len(command), command)
-	_, err := conn.Write([]byte(msg))
-	if err != nil {
-		return fmt.Errorf("发送 ADB 命令失败: %w", err)
-	}
-	return nil
-}
-
-func adbCheckOKAY(conn net.Conn) error {
-	status, err := readExact(conn, 4)
-	if err != nil {
-		return err
-	}
-	if string(status) == "OKAY" {
-		return nil
-	}
-	lenBuf, err := readExact(conn, 4)
-	if err != nil {
-		return fmt.Errorf("adb %s (no error detail: %v)", status, err)
-	}
-	size, err := strconv.ParseInt(string(lenBuf), 16, 64)
-	if err != nil {
-		return fmt.Errorf("adb %s", status)
-	}
-	msg, err := readExact(conn, int(size))
-	if err != nil {
-		return fmt.Errorf("adb %s: %s", status, msg)
-	}
-	return fmt.Errorf("adb %s: %s", status, strings.TrimSpace(string(msg)))
-}
-
-func readExact(conn net.Conn, n int) ([]byte, error) {
-	buf := make([]byte, n)
-	_, err := io.ReadFull(conn, buf)
-	return buf, err
-}
-
 // rootResult interprets the payload of the root: service. "cannot run as
-// root" is a failure even though the socket status is OKAY. A restarting
-// adbd needs the same pause the adb client waits before returning.
+// root" is a failure even when the transport accepted the command. A
+// restarting adbd needs a short pause before the tool returns.
 func rootResult(ctx context.Context, message string) (string, error) {
 	message = strings.TrimSpace(message)
 	if strings.Contains(strings.ToLower(message), "cannot run as root") {
@@ -653,46 +503,20 @@ func rootResult(ctx context.Context, message string) (string, error) {
 	return message, nil
 }
 
-// androidPushFile uploads a local file to the Android device via ADB.
+// androidPushFile uploads a local file over the phone's USB debug interface.
 func androidPushFile(localPath, remotePath string) (string, error) {
 	debugLogf("androidPushFile: local=%s, remote=%s\n", localPath, remotePath)
-
-	devices, err := listADBDevices()
-	if err != nil || len(devices) == 0 {
-		return "", fmt.Errorf("file transfer requires an ADB-connected device (no device found)")
-	}
-
-	f, err := os.Open(localPath)
-	if err != nil {
-		return "", fmt.Errorf("cannot open local file: %w", err)
-	}
-	defer f.Close()
-
-	dev := devices[0]
-	if err := dev.PushFile(f, remotePath); err != nil {
-		return "", fmt.Errorf("push failed: %w", err)
+	if err := usbPush(localPath, remotePath); err != nil {
+		return "", err
 	}
 	return fmt.Sprintf("pushed %s -> %s", localPath, remotePath), nil
 }
 
-// androidPullFile downloads a file from the Android device to local via ADB.
+// androidPullFile downloads a file over the phone's USB debug interface.
 func androidPullFile(remotePath, localPath string) (string, error) {
 	debugLogf("androidPullFile: remote=%s, local=%s\n", remotePath, localPath)
-
-	devices, err := listADBDevices()
-	if err != nil || len(devices) == 0 {
-		return "", fmt.Errorf("file transfer requires an ADB-connected device (no device found)")
-	}
-
-	f, err := os.Create(localPath)
-	if err != nil {
-		return "", fmt.Errorf("cannot create local file: %w", err)
-	}
-	defer f.Close()
-
-	dev := devices[0]
-	if err := dev.Pull(remotePath, f); err != nil {
-		return "", fmt.Errorf("pull failed: %w", err)
+	if err := usbPull(remotePath, localPath); err != nil {
+		return "", err
 	}
 	return fmt.Sprintf("pulled %s -> %s", remotePath, localPath), nil
 }
@@ -726,26 +550,20 @@ func wrapBackgroundCommand(command string) string {
 func executeAndroidCommands(command string, sleepSeconds int) (string, error) {
 	debugLogf("executeAndroidCommands: command=%s, sleepSeconds=%d\n", command, sleepSeconds)
 
-	devices, err := listADBDevices()
-	if err != nil {
-		return "", fmt.Errorf("failed to list ADB devices: %w; use the serial fallback if needed", err)
-	}
-	if len(devices) == 0 {
-		return "", fmt.Errorf("no ADB device connected; use the serial fallback if needed")
-	}
-	dev := devices[0]
+	// The shell runs on a PTY. Background commands are detached so the
+	// session ending does not kill them or hold the USB channel open.
+	shellCommand := wrapBackgroundCommand(command)
+	debugLogf("executeAndroidCommands: shellCommand=%s\n", shellCommand)
 
-	// Wrap background commands with nohup and output redirection.
-	// ADB shell uses a PTY: when the shell exits, SIGHUP kills background
-	// processes.  nohup prevents that, and redirecting stdout/stderr avoids
-	// the PTY file-descriptor keeping the ADB connection open indefinitely.
-	adbCommand := wrapBackgroundCommand(command)
-	debugLogf("executeAndroidCommands: adbCommand=%s\n", adbCommand)
-
-	shellOutput, err := dev.RunShellCommand(adbCommand, "")
+	shellOutput, err := usbShell("", shellCommand, commandDeadline(sleepSeconds))
 	shellOutput = truncateString(shellOutput, 20000)
-	checkErr(err, "RunShellCommand")
-	return shellOutput, err
+	if err != nil {
+		if shellOutput != "" {
+			return "", fmt.Errorf("%w\n%s；需要的话可以用串口备用工具", err, shellOutput)
+		}
+		return "", fmt.Errorf("%w；需要的话可以用串口备用工具", err)
+	}
+	return shellOutput, nil
 }
 
 // executeAndroidCommandsFallback uses serial port instead of SSH
@@ -763,20 +581,17 @@ func executeAndroidCommandsFallback(command string, sleepSeconds int) (string, e
 
 func executeQNXCommands(command string, sleepSeconds int) (string, error) {
 	debugLogf("executeQNXCommands: command=%s, sleepSeconds=%d\n", command, sleepSeconds)
-	devices, err := listADBDevices()
-	if err != nil {
-		return "", fmt.Errorf("failed to list ADB devices: %w; use the serial fallback if needed", err)
-	}
-	if len(devices) == 0 {
-		return "", fmt.Errorf("no ADB device connected; use the serial fallback if needed")
-	}
-	dev := devices[0]
 	binDir := qnxBinDir(command)
 	commandString := "dbclient -o StrictHostKeyChecking=no root@192.168.1.1 \"" + binDir + "/" + command + "\""
-	shellOutput, err := dev.RunShellCommand(commandString, "")
+	shellOutput, err := usbShell("", commandString, commandDeadline(sleepSeconds))
 	shellOutput = truncateString(shellOutput, 20000)
-	checkErr(err, "RunShellCommand")
-	return shellOutput, err
+	if err != nil {
+		if shellOutput != "" {
+			return "", fmt.Errorf("%w\n%s；需要的话可以用串口备用工具", err, shellOutput)
+		}
+		return "", fmt.Errorf("%w；需要的话可以用串口备用工具", err)
+	}
+	return shellOutput, nil
 }
 
 // executeQNXCommandsFallback uses serial port instead of SSH
