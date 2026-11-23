@@ -534,7 +534,11 @@ func selectDevice(serial string) (gadb.Device, error) {
 		os.Stderr = stderr
 	}()
 
-	devices, err := adbClient.DeviceList()
+	client, err := gadb.NewClient()
+	if err != nil {
+		return gadb.Device{}, fmt.Errorf("连接 ADB 服务 %s 失败: %w", adbServerAddr, err)
+	}
+	devices, err := client.DeviceList()
 	if err != nil {
 		return gadb.Device{}, fmt.Errorf("列出 ADB 设备失败: %w", err)
 	}
