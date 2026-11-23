@@ -10,10 +10,7 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -503,9 +500,9 @@ var adbScreenshotDeadline = 30 * time.Second
 // restarting, wait for it to come back before the tool returns.
 var adbRootRestartWait = 3 * time.Second
 
-// listADBDevices dials 127.0.0.1:5037. A failed startup used to keep a
-// zero client and later dial ":0". If nothing is listening, start the
-// adb server and try again.
+// listADBDevices dials 127.0.0.1:5037 on every call. It does not look up
+// or start the adb executable. A failed startup used to keep a zero
+// client and later dial ":0".
 func listADBDevices() ([]gadb.Device, error) {
 	stdout, stderr := os.Stdout, os.Stderr
 	if logFile != nil {
@@ -517,100 +514,11 @@ func listADBDevices() ([]gadb.Device, error) {
 		os.Stderr = stderr
 	}()
 
-	client, err := connectADB()
+	client, err := gadb.NewClientWith("127.0.0.1", gadb.AdbServerPort)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("连接 ADB 服务 %s 失败: %w", adbServerAddr, err)
 	}
 	return client.DeviceList()
-}
-
-func connectADB() (gadb.Client, error) {
-	client, err := dialADB()
-	if err == nil {
-		return client, nil
-	}
-	dialErr := err
-	debugLogf("adb dial failed: %v\n", dialErr)
-	if startErr := startADBServer(); startErr != nil {
-		return gadb.Client{}, fmt.Errorf("连接 ADB 服务 %s 失败: %v; %w", adbServerAddr, startErr, dialErr)
-	}
-	var last error
-	for i := 0; i < 10; i++ {
-		client, err = dialADB()
-		if err == nil {
-			return client, nil
-		}
-		last = err
-		time.Sleep(200 * time.Millisecond)
-	}
-	return gadb.Client{}, fmt.Errorf("连接 ADB 服务 %s 失败: %w", adbServerAddr, last)
-}
-
-func dialADB() (gadb.Client, error) {
-	return gadb.NewClientWith("127.0.0.1", gadb.AdbServerPort)
-}
-
-func startADBServer() error {
-	exe := findADB()
-	if exe == "" {
-		return fmt.Errorf("找不到 adb，无法启动本机 ADB 服务")
-	}
-	debugLogf("starting adb server with %s\n", exe)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, exe, "start-server")
-	if logFile != nil {
-		cmd.Stdout = logFile
-		cmd.Stderr = logFile
-	}
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("adb start-server 失败: %w", err)
-	}
-	return nil
-}
-
-func findADB() string {
-	name := "adb"
-	if runtime.GOOS == "windows" {
-		name = "adb.exe"
-	}
-	var candidates []string
-	if p, err := exec.LookPath(name); err == nil {
-		candidates = append(candidates, p)
-	}
-	for _, env := range []string{"ANDROID_HOME", "ANDROID_SDK_ROOT"} {
-		if v := os.Getenv(env); v != "" {
-			candidates = append(candidates, filepath.Join(v, "platform-tools", name))
-		}
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		local := os.Getenv("LOCALAPPDATA")
-		if local == "" {
-			local = filepath.Join(home, "AppData", "Local")
-		}
-		candidates = append(candidates,
-			filepath.Join(local, "Android", "Sdk", "platform-tools", name),
-			filepath.Join(home, "AppData", "Local", "Android", "Sdk", "platform-tools", name),
-			filepath.Join(home, "Android", "Sdk", "platform-tools", name),
-			filepath.Join(home, "Library", "Android", "sdk", "platform-tools", name),
-		)
-	}
-	return firstExistingFile(candidates...)
-}
-
-func firstExistingFile(paths ...string) string {
-	seen := make(map[string]bool, len(paths))
-	for _, path := range paths {
-		if path == "" || seen[path] {
-			continue
-		}
-		seen[path] = true
-		info, err := os.Stat(path)
-		if err == nil && !info.IsDir() {
-			return path
-		}
-	}
-	return ""
 }
 
 // selectDevice picks a device from the ADB server. An empty serial is

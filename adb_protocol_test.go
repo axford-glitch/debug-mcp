@@ -5,8 +5,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -91,20 +89,6 @@ func TestAdbHostCommandBestEffortWhenConnectionStaysOpen(t *testing.T) {
 func TestADBServerUsesIPv4Loopback(t *testing.T) {
 	if adbServerAddr != "127.0.0.1:5037" {
 		t.Fatalf("server address %s", adbServerAddr)
-	}
-}
-
-func TestFirstExistingFile(t *testing.T) {
-	dir := t.TempDir()
-	adb := filepath.Join(dir, "adb.exe")
-	if err := os.WriteFile(adb, []byte("x"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if got := firstExistingFile(filepath.Join(dir, "missing"), adb); got != adb {
-		t.Fatalf("got %q", got)
-	}
-	if got := firstExistingFile(filepath.Join(dir, "missing")); got != "" {
-		t.Fatalf("got %q", got)
 	}
 }
 
