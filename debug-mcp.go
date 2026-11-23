@@ -8,7 +8,6 @@ import (
 	"image/png"
 	"log"
 	"os"
-	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
@@ -16,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/electricbubble/gadb"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"go.bug.st/serial"
@@ -31,12 +29,6 @@ var serialMutex sync.Mutex
 const debugEnabled = true
 
 var logFile *os.File
-
-// origStdout/origStderr save original stdout/stderr for temporary redirection
-var origStdout, origStderr *os.File
-
-// adbClient is the global ADB client
-var adbClient gadb.Client
 
 // commands in /mnt/usr/bin/ (not /ifs/bin/)
 var mntUsrBinCommands = map[string]bool{
@@ -164,23 +156,6 @@ func main() {
 
 	// 2. init MCP Server
 	s := server.NewMCPServer("debug-mcp-server", "1.0.0")
-
-	// temp redirect stdout/stderr to log file to avoid gadb output interfering with MCP stdio
-	origStdout = os.Stdout
-	origStderr = os.Stderr
-	os.Stdout = logFile
-	os.Stderr = logFile
-
-	client, err := gadb.NewClient()
-
-	// restore stdout/stderr
-	os.Stdout = origStdout
-	os.Stderr = origStderr
-
-	if err != nil {
-		debugLogf("gadb.NewClient failed: %v\n", err)
-	}
-	adbClient = client
 
 	// 3. execute_android_commands tool
 	executeAndroidCommandsTool := mcp.NewTool("execute_android_commands",
@@ -453,13 +428,12 @@ func main() {
 	})
 
 	for _, tool := range []struct {
-		name, description string
-		args              []string
-		image             bool
+		name, description, service string
+		image                      bool
 	}{
-		{"adb_root", "重启设备上的 adbd 并请求 root 权限", []string{"root"}, false},
-		{"adb_reboot", "重启 Android 设备", []string{"reboot"}, false},
-		{"adb_screenshot", "获取 Android 设备屏幕截图", []string{"exec-out", "screencap", "-p"}, true},
+		{"adb_root", "重启设备上的 adbd 并请求 root 权限", "root:", false},
+		{"adb_reboot", "重启 Android 设备", "reboot:", false},
+		{"adb_screenshot", "获取 Android 设备屏幕截图", "exec:screencap -p", true},
 	} {
 		tool := tool
 		s.AddTool(mcp.NewTool(tool.name, mcp.WithDescription(tool.description),
@@ -470,17 +444,32 @@ func main() {
 				if args["serial"] != nil && !ok {
 					return mcp.NewToolResultError("serial 必须是字符串"), nil
 				}
-				output, err := runADB(ctx, serial, tool.args...)
-				if err != nil {
-					return mcp.NewToolResultError(err.Error()), nil
-				}
 				if tool.image {
+					// exec: is the binary channel. shell: would translate newlines and corrupt the PNG.
+					output, err := usbService(serial, tool.service, 30*time.Second)
+					if err != nil {
+						return mcp.NewToolResultError(err.Error()), nil
+					}
 					if _, err := png.DecodeConfig(bytes.NewReader(output)); err != nil {
 						return mcp.NewToolResultError("截图不是有效的 PNG: " + err.Error()), nil
 					}
 					return mcp.NewToolResultImage("截图成功", base64.StdEncoding.EncodeToString(output), "image/png"), nil
 				}
-				return mcp.NewToolResultText(strings.TrimSpace(string(output))), nil
+				output, err := usbService(serial, tool.service, 15*time.Second)
+				if err != nil {
+					return mcp.NewToolResultError(err.Error()), nil
+				}
+				text := strings.TrimSpace(string(output))
+				if tool.name == "adb_root" {
+					text, err = rootResult(ctx, text)
+					if err != nil {
+						return mcp.NewToolResultError(err.Error()), nil
+					}
+				}
+				if text == "" && tool.name == "adb_reboot" {
+					text = "rebooting"
+				}
+				return mcp.NewToolResultText(text), nil
 			})
 	}
 
@@ -490,80 +479,44 @@ func main() {
 	}
 }
 
-func runADB(ctx context.Context, serial string, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	isRoot := len(args) == 1 && args[0] == "root"
-	if serial != "" {
-		args = append([]string{"-s", serial}, args...)
+// adbRootRestartWait matches the usual client: after adbd says it is
+// restarting, wait for it to come back before the tool returns.
+var adbRootRestartWait = 3 * time.Second
+
+// rootResult interprets the payload of the root: service. "cannot run as
+// root" is a failure even when the transport accepted the command. A
+// restarting adbd needs a short pause before the tool returns.
+func rootResult(ctx context.Context, message string) (string, error) {
+	message = strings.TrimSpace(message)
+	if strings.Contains(strings.ToLower(message), "cannot run as root") {
+		return "", fmt.Errorf("adb root 失败: %s", message)
 	}
-	cmd := exec.CommandContext(ctx, "adb", args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("adb 执行失败: %w: %s", err, strings.TrimSpace(stderr.String()))
+	if message == "" || strings.Contains(message, "restarting") {
+		timer := time.NewTimer(adbRootRestartWait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
 	}
-	message := strings.TrimSpace(string(output) + "\n" + stderr.String())
-	if isRoot && strings.Contains(strings.ToLower(message), "cannot run as root") {
-		return nil, fmt.Errorf("adb root 失败: %s", message)
-	}
-	if isRoot && len(output) == 0 {
-		output = []byte(message)
-	}
-	return output, nil
+	return message, nil
 }
 
-// androidPushFile uploads a local file to the Android device via ADB.
+// androidPushFile uploads a local file over the phone's USB debug interface.
 func androidPushFile(localPath, remotePath string) (string, error) {
 	debugLogf("androidPushFile: local=%s, remote=%s\n", localPath, remotePath)
-
-	os.Stdout = logFile
-	os.Stderr = logFile
-	devices, err := adbClient.DeviceList()
-	os.Stdout = origStdout
-	os.Stderr = origStderr
-
-	if err != nil || len(devices) == 0 {
-		return "", fmt.Errorf("file transfer requires an ADB-connected device (no device found)")
-	}
-
-	f, err := os.Open(localPath)
-	if err != nil {
-		return "", fmt.Errorf("cannot open local file: %w", err)
-	}
-	defer f.Close()
-
-	dev := devices[0]
-	if err := dev.PushFile(f, remotePath); err != nil {
-		return "", fmt.Errorf("push failed: %w", err)
+	if err := usbPush(localPath, remotePath); err != nil {
+		return "", err
 	}
 	return fmt.Sprintf("pushed %s -> %s", localPath, remotePath), nil
 }
 
-// androidPullFile downloads a file from the Android device to local via ADB.
+// androidPullFile downloads a file over the phone's USB debug interface.
 func androidPullFile(remotePath, localPath string) (string, error) {
 	debugLogf("androidPullFile: remote=%s, local=%s\n", remotePath, localPath)
-
-	os.Stdout = logFile
-	os.Stderr = logFile
-	devices, err := adbClient.DeviceList()
-	os.Stdout = origStdout
-	os.Stderr = origStderr
-
-	if err != nil || len(devices) == 0 {
-		return "", fmt.Errorf("file transfer requires an ADB-connected device (no device found)")
-	}
-
-	f, err := os.Create(localPath)
-	if err != nil {
-		return "", fmt.Errorf("cannot create local file: %w", err)
-	}
-	defer f.Close()
-
-	dev := devices[0]
-	if err := dev.Pull(remotePath, f); err != nil {
-		return "", fmt.Errorf("pull failed: %w", err)
+	if err := usbPull(remotePath, localPath); err != nil {
+		return "", err
 	}
 	return fmt.Sprintf("pulled %s -> %s", remotePath, localPath), nil
 }
@@ -597,31 +550,20 @@ func wrapBackgroundCommand(command string) string {
 func executeAndroidCommands(command string, sleepSeconds int) (string, error) {
 	debugLogf("executeAndroidCommands: command=%s, sleepSeconds=%d\n", command, sleepSeconds)
 
-	os.Stdout = logFile
-	os.Stderr = logFile
-	devices, err := adbClient.DeviceList()
-	os.Stdout = origStdout
-	os.Stderr = origStderr
+	// The shell runs on a PTY. Background commands are detached so the
+	// session ending does not kill them or hold the USB channel open.
+	shellCommand := wrapBackgroundCommand(command)
+	debugLogf("executeAndroidCommands: shellCommand=%s\n", shellCommand)
 
-	if err != nil {
-		return "", fmt.Errorf("failed to list ADB devices: %w; use the serial fallback if needed", err)
-	}
-	if len(devices) == 0 {
-		return "", fmt.Errorf("no ADB device connected; use the serial fallback if needed")
-	}
-	dev := devices[0]
-
-	// Wrap background commands with nohup and output redirection.
-	// ADB shell uses a PTY: when the shell exits, SIGHUP kills background
-	// processes.  nohup prevents that, and redirecting stdout/stderr avoids
-	// the PTY file-descriptor keeping the ADB connection open indefinitely.
-	adbCommand := wrapBackgroundCommand(command)
-	debugLogf("executeAndroidCommands: adbCommand=%s\n", adbCommand)
-
-	shellOutput, err := dev.RunShellCommand(adbCommand, "")
+	shellOutput, err := usbShell("", shellCommand, commandDeadline(sleepSeconds))
 	shellOutput = truncateString(shellOutput, 20000)
-	checkErr(err, "RunShellCommand")
-	return shellOutput, err
+	if err != nil {
+		if shellOutput != "" {
+			return "", fmt.Errorf("%w\n%s；需要的话可以用串口备用工具", err, shellOutput)
+		}
+		return "", fmt.Errorf("%w；需要的话可以用串口备用工具", err)
+	}
+	return shellOutput, nil
 }
 
 // executeAndroidCommandsFallback uses serial port instead of SSH
@@ -639,25 +581,17 @@ func executeAndroidCommandsFallback(command string, sleepSeconds int) (string, e
 
 func executeQNXCommands(command string, sleepSeconds int) (string, error) {
 	debugLogf("executeQNXCommands: command=%s, sleepSeconds=%d\n", command, sleepSeconds)
-	os.Stdout = logFile
-	os.Stderr = logFile
-	devices, err := adbClient.DeviceList()
-	os.Stdout = origStdout
-	os.Stderr = origStderr
-
-	if err != nil {
-		return "", fmt.Errorf("failed to list ADB devices: %w; use the serial fallback if needed", err)
-	}
-	if len(devices) == 0 {
-		return "", fmt.Errorf("no ADB device connected; use the serial fallback if needed")
-	}
-	dev := devices[0]
 	binDir := qnxBinDir(command)
 	commandString := "dbclient -o StrictHostKeyChecking=no root@192.168.1.1 \"" + binDir + "/" + command + "\""
-	shellOutput, err := dev.RunShellCommand(commandString, "")
+	shellOutput, err := usbShell("", commandString, commandDeadline(sleepSeconds))
 	shellOutput = truncateString(shellOutput, 20000)
-	checkErr(err, "RunShellCommand")
-	return shellOutput, err
+	if err != nil {
+		if shellOutput != "" {
+			return "", fmt.Errorf("%w\n%s；需要的话可以用串口备用工具", err, shellOutput)
+		}
+		return "", fmt.Errorf("%w；需要的话可以用串口备用工具", err)
+	}
+	return shellOutput, nil
 }
 
 // executeQNXCommandsFallback uses serial port instead of SSH
