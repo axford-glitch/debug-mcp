@@ -10,7 +10,10 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,12 +35,6 @@ var serialMutex sync.Mutex
 const debugEnabled = true
 
 var logFile *os.File
-
-// origStdout/origStderr save original stdout/stderr for temporary redirection
-var origStdout, origStderr *os.File
-
-// adbClient is the global ADB client
-var adbClient gadb.Client
 
 // commands in /mnt/usr/bin/ (not /ifs/bin/)
 var mntUsrBinCommands = map[string]bool{
@@ -165,23 +162,6 @@ func main() {
 
 	// 2. init MCP Server
 	s := server.NewMCPServer("debug-mcp-server", "1.0.0")
-
-	// temp redirect stdout/stderr to log file to avoid gadb output interfering with MCP stdio
-	origStdout = os.Stdout
-	origStderr = os.Stderr
-	os.Stdout = logFile
-	os.Stderr = logFile
-
-	client, err := gadb.NewClient()
-
-	// restore stdout/stderr
-	os.Stdout = origStdout
-	os.Stderr = origStderr
-
-	if err != nil {
-		debugLogf("gadb.NewClient failed: %v\n", err)
-	}
-	adbClient = client
 
 	// 3. execute_android_commands tool
 	executeAndroidCommandsTool := mcp.NewTool("execute_android_commands",
@@ -508,9 +488,9 @@ func main() {
 	}
 }
 
-// adbServerAddr is the local adb server socket. gadb uses the same port.
-// Nothing here looks up the adb executable, so PATH is not involved.
-var adbServerAddr = fmt.Sprintf("localhost:%d", gadb.AdbServerPort)
+// adbServerAddr is the IPv4 socket the adb server listens on. "localhost"
+// can resolve to ::1, which Windows rejects when adb is bound to 127.0.0.1.
+var adbServerAddr = fmt.Sprintf("127.0.0.1:%d", gadb.AdbServerPort)
 
 // adbCommandDeadline bounds root/reboot. Those services usually close
 // right after OKAY; the deadline stops a stuck socket from hanging.
@@ -523,24 +503,122 @@ var adbScreenshotDeadline = 30 * time.Second
 // restarting, wait for it to come back before the tool returns.
 var adbRootRestartWait = 3 * time.Second
 
-// selectDevice picks a device from the ADB server. An empty serial is
-// accepted only when exactly one device is connected.
-func selectDevice(serial string) (gadb.Device, error) {
+// listADBDevices dials 127.0.0.1:5037. A failed startup used to keep a
+// zero client and later dial ":0". If nothing is listening, start the
+// adb server and try again.
+func listADBDevices() ([]gadb.Device, error) {
 	stdout, stderr := os.Stdout, os.Stderr
-	os.Stdout = logFile
-	os.Stderr = logFile
+	if logFile != nil {
+		os.Stdout = logFile
+		os.Stderr = logFile
+	}
 	defer func() {
 		os.Stdout = stdout
 		os.Stderr = stderr
 	}()
 
-	client, err := gadb.NewClient()
+	client, err := connectADB()
 	if err != nil {
-		return gadb.Device{}, fmt.Errorf("连接 ADB 服务 %s 失败: %w", adbServerAddr, err)
+		return nil, err
 	}
-	devices, err := client.DeviceList()
+	return client.DeviceList()
+}
+
+func connectADB() (gadb.Client, error) {
+	client, err := dialADB()
+	if err == nil {
+		return client, nil
+	}
+	dialErr := err
+	debugLogf("adb dial failed: %v\n", dialErr)
+	if startErr := startADBServer(); startErr != nil {
+		return gadb.Client{}, fmt.Errorf("连接 ADB 服务 %s 失败: %v; %w", adbServerAddr, startErr, dialErr)
+	}
+	var last error
+	for i := 0; i < 10; i++ {
+		client, err = dialADB()
+		if err == nil {
+			return client, nil
+		}
+		last = err
+		time.Sleep(200 * time.Millisecond)
+	}
+	return gadb.Client{}, fmt.Errorf("连接 ADB 服务 %s 失败: %w", adbServerAddr, last)
+}
+
+func dialADB() (gadb.Client, error) {
+	return gadb.NewClientWith("127.0.0.1", gadb.AdbServerPort)
+}
+
+func startADBServer() error {
+	exe := findADB()
+	if exe == "" {
+		return fmt.Errorf("找不到 adb，无法启动本机 ADB 服务")
+	}
+	debugLogf("starting adb server with %s\n", exe)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe, "start-server")
+	if logFile != nil {
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+	}
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("adb start-server 失败: %w", err)
+	}
+	return nil
+}
+
+func findADB() string {
+	name := "adb"
+	if runtime.GOOS == "windows" {
+		name = "adb.exe"
+	}
+	var candidates []string
+	if p, err := exec.LookPath(name); err == nil {
+		candidates = append(candidates, p)
+	}
+	for _, env := range []string{"ANDROID_HOME", "ANDROID_SDK_ROOT"} {
+		if v := os.Getenv(env); v != "" {
+			candidates = append(candidates, filepath.Join(v, "platform-tools", name))
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		local := os.Getenv("LOCALAPPDATA")
+		if local == "" {
+			local = filepath.Join(home, "AppData", "Local")
+		}
+		candidates = append(candidates,
+			filepath.Join(local, "Android", "Sdk", "platform-tools", name),
+			filepath.Join(home, "AppData", "Local", "Android", "Sdk", "platform-tools", name),
+			filepath.Join(home, "Android", "Sdk", "platform-tools", name),
+			filepath.Join(home, "Library", "Android", "sdk", "platform-tools", name),
+		)
+	}
+	return firstExistingFile(candidates...)
+}
+
+func firstExistingFile(paths ...string) string {
+	seen := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		info, err := os.Stat(path)
+		if err == nil && !info.IsDir() {
+			return path
+		}
+	}
+	return ""
+}
+
+// selectDevice picks a device from the ADB server. An empty serial is
+// accepted only when exactly one device is connected.
+func selectDevice(serial string) (gadb.Device, error) {
+	devices, err := listADBDevices()
 	if err != nil {
-		return gadb.Device{}, fmt.Errorf("列出 ADB 设备失败: %w", err)
+		return gadb.Device{}, err
 	}
 
 	serial = strings.TrimSpace(serial)
@@ -671,12 +749,7 @@ func rootResult(ctx context.Context, message string) (string, error) {
 func androidPushFile(localPath, remotePath string) (string, error) {
 	debugLogf("androidPushFile: local=%s, remote=%s\n", localPath, remotePath)
 
-	os.Stdout = logFile
-	os.Stderr = logFile
-	devices, err := adbClient.DeviceList()
-	os.Stdout = origStdout
-	os.Stderr = origStderr
-
+	devices, err := listADBDevices()
 	if err != nil || len(devices) == 0 {
 		return "", fmt.Errorf("file transfer requires an ADB-connected device (no device found)")
 	}
@@ -698,12 +771,7 @@ func androidPushFile(localPath, remotePath string) (string, error) {
 func androidPullFile(remotePath, localPath string) (string, error) {
 	debugLogf("androidPullFile: remote=%s, local=%s\n", remotePath, localPath)
 
-	os.Stdout = logFile
-	os.Stderr = logFile
-	devices, err := adbClient.DeviceList()
-	os.Stdout = origStdout
-	os.Stderr = origStderr
-
+	devices, err := listADBDevices()
 	if err != nil || len(devices) == 0 {
 		return "", fmt.Errorf("file transfer requires an ADB-connected device (no device found)")
 	}
@@ -750,12 +818,7 @@ func wrapBackgroundCommand(command string) string {
 func executeAndroidCommands(command string, sleepSeconds int) (string, error) {
 	debugLogf("executeAndroidCommands: command=%s, sleepSeconds=%d\n", command, sleepSeconds)
 
-	os.Stdout = logFile
-	os.Stderr = logFile
-	devices, err := adbClient.DeviceList()
-	os.Stdout = origStdout
-	os.Stderr = origStderr
-
+	devices, err := listADBDevices()
 	if err != nil {
 		return "", fmt.Errorf("failed to list ADB devices: %w; use the serial fallback if needed", err)
 	}
@@ -792,12 +855,7 @@ func executeAndroidCommandsFallback(command string, sleepSeconds int) (string, e
 
 func executeQNXCommands(command string, sleepSeconds int) (string, error) {
 	debugLogf("executeQNXCommands: command=%s, sleepSeconds=%d\n", command, sleepSeconds)
-	os.Stdout = logFile
-	os.Stderr = logFile
-	devices, err := adbClient.DeviceList()
-	os.Stdout = origStdout
-	os.Stderr = origStderr
-
+	devices, err := listADBDevices()
 	if err != nil {
 		return "", fmt.Errorf("failed to list ADB devices: %w; use the serial fallback if needed", err)
 	}
