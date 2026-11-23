@@ -6,9 +6,10 @@ import (
 	"encoding/base64"
 	"fmt"
 	"image/png"
+	"io"
 	"log"
+	"net"
 	"os"
-	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
@@ -453,13 +454,12 @@ func main() {
 	})
 
 	for _, tool := range []struct {
-		name, description string
-		args              []string
-		image             bool
+		name, description, service string
+		image                      bool
 	}{
-		{"adb_root", "重启设备上的 adbd 并请求 root 权限", []string{"root"}, false},
-		{"adb_reboot", "重启 Android 设备", []string{"reboot"}, false},
-		{"adb_screenshot", "获取 Android 设备屏幕截图", []string{"exec-out", "screencap", "-p"}, true},
+		{"adb_root", "重启设备上的 adbd 并请求 root 权限", "root:", false},
+		{"adb_reboot", "重启 Android 设备", "reboot:", false},
+		{"adb_screenshot", "获取 Android 设备屏幕截图", "exec:screencap -p", true},
 	} {
 		tool := tool
 		s.AddTool(mcp.NewTool(tool.name, mcp.WithDescription(tool.description),
@@ -470,17 +470,35 @@ func main() {
 				if args["serial"] != nil && !ok {
 					return mcp.NewToolResultError("serial 必须是字符串"), nil
 				}
-				output, err := runADB(ctx, serial, tool.args...)
+				dev, err := selectDevice(serial)
 				if err != nil {
 					return mcp.NewToolResultError(err.Error()), nil
 				}
 				if tool.image {
+					// exec: is adb exec-out. shell: would translate newlines and corrupt the PNG.
+					output, err := adbExecOut(dev.Serial(), "screencap -p")
+					if err != nil {
+						return mcp.NewToolResultError(err.Error()), nil
+					}
 					if _, err := png.DecodeConfig(bytes.NewReader(output)); err != nil {
 						return mcp.NewToolResultError("截图不是有效的 PNG: " + err.Error()), nil
 					}
 					return mcp.NewToolResultImage("截图成功", base64.StdEncoding.EncodeToString(output), "image/png"), nil
 				}
-				return mcp.NewToolResultText(strings.TrimSpace(string(output))), nil
+				text, err := adbHostCommand(dev.Serial(), tool.service)
+				if err != nil {
+					return mcp.NewToolResultError(err.Error()), nil
+				}
+				if tool.name == "adb_root" {
+					text, err = rootResult(ctx, text)
+					if err != nil {
+						return mcp.NewToolResultError(err.Error()), nil
+					}
+				}
+				if text == "" && tool.name == "adb_reboot" {
+					text = "rebooting"
+				}
+				return mcp.NewToolResultText(text), nil
 			})
 	}
 
@@ -490,28 +508,159 @@ func main() {
 	}
 }
 
-func runADB(ctx context.Context, serial string, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	isRoot := len(args) == 1 && args[0] == "root"
-	if serial != "" {
-		args = append([]string{"-s", serial}, args...)
-	}
-	cmd := exec.CommandContext(ctx, "adb", args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	output, err := cmd.Output()
+// adbServerAddr is the local adb server socket. gadb uses the same port.
+// Nothing here looks up the adb executable, so PATH is not involved.
+var adbServerAddr = fmt.Sprintf("localhost:%d", gadb.AdbServerPort)
+
+// adbCommandDeadline bounds root/reboot. Those services usually close
+// right after OKAY; the deadline stops a stuck socket from hanging.
+var adbCommandDeadline = 10 * time.Second
+
+// adbScreenshotDeadline bounds exec-out screencap, which streams a PNG.
+var adbScreenshotDeadline = 30 * time.Second
+
+// adbRootRestartWait matches the adb client: after adbd says it is
+// restarting, wait for it to come back before the tool returns.
+var adbRootRestartWait = 3 * time.Second
+
+// selectDevice picks a device from the ADB server. An empty serial is
+// accepted only when exactly one device is connected.
+func selectDevice(serial string) (gadb.Device, error) {
+	stdout, stderr := os.Stdout, os.Stderr
+	os.Stdout = logFile
+	os.Stderr = logFile
+	defer func() {
+		os.Stdout = stdout
+		os.Stderr = stderr
+	}()
+
+	devices, err := adbClient.DeviceList()
 	if err != nil {
-		return nil, fmt.Errorf("adb 执行失败: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return gadb.Device{}, fmt.Errorf("列出 ADB 设备失败: %w", err)
 	}
-	message := strings.TrimSpace(string(output) + "\n" + stderr.String())
-	if isRoot && strings.Contains(strings.ToLower(message), "cannot run as root") {
-		return nil, fmt.Errorf("adb root 失败: %s", message)
+
+	serial = strings.TrimSpace(serial)
+	if serial != "" {
+		for _, dev := range devices {
+			if dev.Serial() == serial {
+				return dev, nil
+			}
+		}
+		return gadb.Device{}, fmt.Errorf("未找到序列号为 %s 的 ADB 设备", serial)
 	}
-	if isRoot && len(output) == 0 {
-		output = []byte(message)
+	switch len(devices) {
+	case 0:
+		return gadb.Device{}, fmt.Errorf("没有已连接的 ADB 设备")
+	case 1:
+		return devices[0], nil
+	default:
+		return gadb.Device{}, fmt.Errorf("连接了多台设备，请传入 serial")
 	}
-	return output, nil
+}
+
+// adbHostCommand sends a device-scoped ADB host command ("root:",
+// "reboot:", ...) over the ADB server protocol. root: and reboot: are
+// fire-and-forget: adbd often closes right after OKAY, so bytes read
+// after that are best-effort status text.
+func adbHostCommand(serial, service string) (string, error) {
+	rest, err := adbExchange(serial, service, adbCommandDeadline, false)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(rest)), nil
+}
+
+// adbExecOut runs a device command the way `adb exec-out` does, returning
+// the raw stdout. Screenshot uses this so PNG bytes are not CRLF-translated.
+func adbExecOut(serial, command string) ([]byte, error) {
+	return adbExchange(serial, "exec:"+command, adbScreenshotDeadline, true)
+}
+
+func adbExchange(serial, service string, deadline time.Duration, strictBody bool) ([]byte, error) {
+	conn, err := net.DialTimeout("tcp", adbServerAddr, 5*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("连接 ADB 服务 %s 失败: %w", adbServerAddr, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(deadline))
+
+	if err := adbSend(conn, fmt.Sprintf("host:transport:%s", serial)); err != nil {
+		return nil, err
+	}
+	if err := adbCheckOKAY(conn); err != nil {
+		return nil, fmt.Errorf("选择设备 %s 失败: %w", serial, err)
+	}
+
+	if err := adbSend(conn, service); err != nil {
+		return nil, err
+	}
+	if err := adbCheckOKAY(conn); err != nil {
+		return nil, err
+	}
+
+	rest, err := io.ReadAll(conn)
+	if strictBody && err != nil {
+		return nil, fmt.Errorf("读取 ADB 响应失败: %w", err)
+	}
+	return rest, nil
+}
+
+func adbSend(conn net.Conn, command string) error {
+	msg := fmt.Sprintf("%04x%s", len(command), command)
+	_, err := conn.Write([]byte(msg))
+	if err != nil {
+		return fmt.Errorf("发送 ADB 命令失败: %w", err)
+	}
+	return nil
+}
+
+func adbCheckOKAY(conn net.Conn) error {
+	status, err := readExact(conn, 4)
+	if err != nil {
+		return err
+	}
+	if string(status) == "OKAY" {
+		return nil
+	}
+	lenBuf, err := readExact(conn, 4)
+	if err != nil {
+		return fmt.Errorf("adb %s (no error detail: %v)", status, err)
+	}
+	size, err := strconv.ParseInt(string(lenBuf), 16, 64)
+	if err != nil {
+		return fmt.Errorf("adb %s", status)
+	}
+	msg, err := readExact(conn, int(size))
+	if err != nil {
+		return fmt.Errorf("adb %s: %s", status, msg)
+	}
+	return fmt.Errorf("adb %s: %s", status, strings.TrimSpace(string(msg)))
+}
+
+func readExact(conn net.Conn, n int) ([]byte, error) {
+	buf := make([]byte, n)
+	_, err := io.ReadFull(conn, buf)
+	return buf, err
+}
+
+// rootResult interprets the payload of the root: service. "cannot run as
+// root" is a failure even though the socket status is OKAY. A restarting
+// adbd needs the same pause the adb client waits before returning.
+func rootResult(ctx context.Context, message string) (string, error) {
+	message = strings.TrimSpace(message)
+	if strings.Contains(strings.ToLower(message), "cannot run as root") {
+		return "", fmt.Errorf("adb root 失败: %s", message)
+	}
+	if message == "" || strings.Contains(message, "restarting") {
+		timer := time.NewTimer(adbRootRestartWait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return message, nil
 }
 
 // androidPushFile uploads a local file to the Android device via ADB.
